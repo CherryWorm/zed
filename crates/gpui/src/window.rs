@@ -3021,7 +3021,6 @@ impl Window {
             bounds: union_bounds,
             content_mask: content_mask.scale(scale),
             rects: scaled_rects,
-            transform: TransformationMatrix::unit(),
         };
         self.next_frame.scene.insert_primitive(batch);
     }
@@ -3066,7 +3065,6 @@ impl Window {
             bounds: union_bounds,
             content_mask: content_mask.scale(scale),
             segments: scaled,
-            transform: TransformationMatrix::unit(),
         };
         self.next_frame.scene.insert_primitive(batch);
     }
