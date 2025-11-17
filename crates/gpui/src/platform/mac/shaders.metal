@@ -445,12 +445,16 @@ struct InstLineVertexOutput {
   float4 position [[position]];
   float4 color [[flat]];
   float clip_distance [[clip_distance]][4];
+  float2 local;
+  float2 half_extents;
 };
 
 struct InstLineFragmentInput {
   uint seg_id [[flat]];
   float4 position [[position]];
   float4 color [[flat]];
+  float2 local;
+  float2 half_extents;
 };
 
 // Same HSLA approach for lines: convert HSLA→RGBA per-vertex to keep instance
@@ -468,26 +472,65 @@ vertex InstLineVertexOutput instanced_line_vertex(
   // Use segment endpoints directly (no transform)
   float2 p0 = float2(seg.p0.x, seg.p0.y);
   float2 p1 = float2(seg.p1.x, seg.p1.y);
+  float2 center = 0.5 * (p0 + p1);
   float2 dir = p1 - p0;
-  float len = max(length(dir), 1e-6);
-  float2 n = float2(-dir.y, dir.x) / len;
-  float half_w = seg.width * 0.5;
-  // uv.x in {0,1} picks endpoint, uv.y in {0,1} picks side
+  float len = max(length(dir), 1e-4);
+  float2 tangent = dir / len;
+  float2 normal = float2(-tangent.y, tangent.x);
+  float half_w = max(seg.width * 0.5, 0.0);
   float2 base = mix(p0, p1, uv.x);
-  float side = (uv.y * 2.0 - 1.0);
-  float2 pos = base + n * side * half_w;
+  float signed_offset = (uv.y - 0.5) * seg.width;
+  float2 pos = base + normal * signed_offset;
+
+  float local_x = dot(pos - center, tangent);
+  float local_y = dot(pos - center, normal);
+  float2 half_extents = float2(len * 0.5, half_w);
 
   float2 viewport = float2((float)viewport_size->width, (float)viewport_size->height);
   float2 ndc_xy = pos / viewport * float2(2., -2.) + float2(-1., 1.);
   float4 device_position = float4(ndc_xy, 0., 1.);
-  // Use simple clipping for lines  
-  float4 clip_distance = float4(1e6);
+  float2 clip_origin = float2(content_mask->bounds.origin.x, content_mask->bounds.origin.y);
+  float2 clip_extent = float2(content_mask->bounds.size.width, content_mask->bounds.size.height);
+  float4 clip_distance = float4(
+      pos.x - clip_origin.x,
+      clip_origin.x + clip_extent.x - pos.x,
+      pos.y - clip_origin.y,
+      clip_origin.y + clip_extent.y - pos.y);
   float4 color = hsla_to_rgba(seg.color);
-  return InstLineVertexOutput{ seg_id, device_position, color, {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w} };
+  return InstLineVertexOutput{
+      seg_id,
+      device_position,
+      color,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w},
+      float2(local_x, local_y),
+      half_extents};
 }
 
 fragment float4 instanced_line_fragment(InstLineFragmentInput input [[stage_in]]) {
-  return input.color;
+  float ddx_local = dfdx(input.local.y);
+  float ddy_local = dfdy(input.local.y);
+  float grad = sqrt(ddx_local * ddx_local + ddy_local * ddy_local);
+  float width = max(grad, 1e-3);
+
+  float2 offsets[4] = {
+    float2(-0.25, -0.25),
+    float2(0.25, -0.25),
+    float2(-0.25, 0.25),
+    float2(0.25, 0.25)
+  };
+
+  float coverage = 0.0;
+  for (uint i = 0; i < 4; ++i) {
+    float sample_local = input.local.y + offsets[i].x * ddx_local + offsets[i].y * ddy_local;
+    float dist = fabs(sample_local) - input.half_extents.y;
+    coverage += saturate(0.5 - dist / width);
+  }
+  coverage *= 0.25;
+
+  float4 color = input.color;
+  color.a *= coverage;
+  color.rgb *= coverage;
+  return color;
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two

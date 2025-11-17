@@ -1250,17 +1250,27 @@ struct InstancedLineVertexOut {
     float4 position: SV_Position;
     float4 color: COLOR0;
     float4 clip: SV_ClipDistance;
+    float2 local: TEXCOORD0;
+    float2 half_extents: TEXCOORD1;
 };
 
 InstancedLineVertexOut instanced_line_vertex(InstancedLineVertexIn vertex, InstancedLineInstance instance) {
-    float2 dir = instance.p1_px - instance.p0_px;
-    float len = length(dir);
-    float2 tangent = len > 0.0 ? dir / len : float2(1.0, 0.0);
+    float2 p0 = instance.p0_px;
+    float2 p1 = instance.p1_px;
+    float2 center = 0.5 * (p0 + p1);
+    float2 dir = p1 - p0;
+    float len = max(length(dir), 1e-4);
+    float2 tangent = dir / len;
     float2 normal = float2(-tangent.y, tangent.x);
+    float half_width = max(instance.thickness_pad.x * 0.5, 0.0);
 
-    float2 along = instance.p0_px + dir * vertex.unit.x;
+    float2 base = lerp(p0, p1, vertex.unit.x);
     float signed_offset = (vertex.unit.y - 0.5) * instance.thickness_pad.x;
-    float2 px = along + normal * signed_offset;
+    float2 px = base + normal * signed_offset;
+
+    float local_x = dot(px - center, tangent);
+    float local_y = dot(px - center, normal);
+    float2 half_extents = float2(len * 0.5, half_width);
 
     InstancedLineVertexOut output;
     output.position = to_device_position_impl(px);
@@ -1276,9 +1286,35 @@ InstancedLineVertexOut instanced_line_vertex(InstancedLineVertexIn vertex, Insta
         px.y - instance.clip_ltrb.y,
         instance.clip_ltrb.w - px.y
     );
+    output.local = float2(local_x, local_y);
+    output.half_extents = half_extents;
     return output;
 }
 
 float4 instanced_line_fragment(InstancedLineVertexOut input): SV_Target {
-    return input.color;
+    float ddx_local = ddx(input.local.y);
+    float ddy_local = ddy(input.local.y);
+    float grad = sqrt(ddx_local * ddx_local + ddy_local * ddy_local);
+    float width = max(grad, 1e-3);
+
+    float2 offsets[4] = {
+        float2(-0.25, -0.25),
+        float2(0.25, -0.25),
+        float2(-0.25, 0.25),
+        float2(0.25, 0.25),
+    };
+
+    float coverage = 0.0;
+    [unroll]
+    for (uint i = 0; i < 4; ++i) {
+        float sample_local = input.local.y + offsets[i].x * ddx_local + offsets[i].y * ddy_local;
+        float dist = abs(sample_local) - input.half_extents.y;
+        coverage += saturate(0.5 - dist / width);
+    }
+    coverage *= 0.25;
+
+    float4 color = input.color;
+    color.a *= coverage;
+    color.rgb *= coverage;
+    return color;
 }
