@@ -16,7 +16,7 @@ use windows::{
             Dxgi::{Common::*, *},
         },
     },
-    core::Interface,
+    core::{Interface, s},
 };
 
 use crate::{
@@ -90,6 +90,8 @@ struct DirectXRenderPipelines {
     underline_pipeline: PipelineState<Underline>,
     mono_sprites: PipelineState<MonochromeSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    instanced_rect_pipeline: InstancedRectPipeline,
+    instanced_line_pipeline: InstancedLinePipeline,
 }
 
 struct DirectXGlobalElements {
@@ -306,6 +308,7 @@ impl DirectXRenderer {
             return Ok(());
         }
         self.pre_draw()?;
+        self.pipelines.begin_frame();
         for batch in scene.batches() {
             match batch {
                 PrimitiveBatch::Shadows(shadows) => self.draw_shadows(shadows),
@@ -324,8 +327,8 @@ impl DirectXRenderer {
                     sprites,
                 } => self.draw_polychrome_sprites(texture_id, sprites),
                 PrimitiveBatch::Surfaces(surfaces) => self.draw_surfaces(surfaces),
-                PrimitiveBatch::InstancedRects(_batches) => Ok(()),
-                PrimitiveBatch::InstancedLines(_batches) => Ok(()),
+                PrimitiveBatch::InstancedRects(batches) => self.draw_instanced_rects(batches),
+                PrimitiveBatch::InstancedLines(batches) => self.draw_instanced_lines(batches),
             }
             .context(format!(
                 "scene too large:\
@@ -630,6 +633,26 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    fn draw_instanced_rects(&mut self, batches: &[InstancedRects]) -> Result<()> {
+        self.pipelines.instanced_rect_pipeline.draw(
+            &self.devices.device,
+            &self.devices.device_context,
+            &self.resources.viewport,
+            &self.globals.global_params_buffer,
+            batches,
+        )
+    }
+
+    fn draw_instanced_lines(&mut self, batches: &[InstancedLines]) -> Result<()> {
+        self.pipelines.instanced_line_pipeline.draw(
+            &self.devices.device,
+            &self.devices.device_context,
+            &self.resources.viewport,
+            &self.globals.global_params_buffer,
+            batches,
+        )
+    }
+
     pub(crate) fn gpu_specs(&self) -> Result<GpuSpecs> {
         let devices = self.devices.as_ref().context("devices missing")?;
         let desc = unsafe { devices.adapter.GetDesc1() }?;
@@ -798,6 +821,9 @@ impl DirectXRenderPipelines {
             16,
             create_blend_state(device)?,
         )?;
+        let unit_quad = UnitQuadGeometry::new(device)?;
+        let instanced_rect_pipeline = InstancedRectPipeline::new(device, &unit_quad)?;
+        let instanced_line_pipeline = InstancedLinePipeline::new(device, &unit_quad)?;
 
         Ok(Self {
             shadow_pipeline,
@@ -807,7 +833,14 @@ impl DirectXRenderPipelines {
             underline_pipeline,
             mono_sprites,
             poly_sprites,
+            instanced_rect_pipeline,
+            instanced_line_pipeline,
         })
+    }
+
+    pub fn begin_frame(&mut self) {
+        self.instanced_rect_pipeline.begin_frame();
+        self.instanced_line_pipeline.begin_frame();
     }
 }
 
@@ -1000,6 +1033,453 @@ impl<T> PipelineState<T> {
             device_context.DrawInstanced(4, instance_count, 0, 0);
         }
         Ok(())
+    }
+}
+
+const MIN_INSTANCE_CAPACITY: usize = 1024;
+const MAX_INSTANCE_CHUNK: usize = 16_384;
+
+#[derive(Clone)]
+struct UnitQuadGeometry {
+    vertex_buffer: ID3D11Buffer,
+    index_buffer: ID3D11Buffer,
+    vertex_stride: u32,
+    index_count: u32,
+}
+
+impl UnitQuadGeometry {
+    fn new(device: &ID3D11Device) -> Result<Self> {
+        let vertices: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let vertex_buffer =
+            create_immutable_buffer(device, &vertices, D3D11_BIND_VERTEX_BUFFER.0 as u32)?;
+
+        let indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
+        let index_buffer =
+            create_immutable_buffer(device, &indices, D3D11_BIND_INDEX_BUFFER.0 as u32)?;
+
+        Ok(Self {
+            vertex_buffer,
+            index_buffer,
+            vertex_stride: std::mem::size_of::<[f32; 2]>() as u32,
+            index_count: indices.len() as u32,
+        })
+    }
+}
+
+#[derive(Default)]
+struct InstanceSlice {
+    offset_bytes: u32,
+    count: u32,
+}
+
+struct InstanceBuffer {
+    buffer: Option<ID3D11Buffer>,
+    stride: u32,
+    capacity: usize,
+    cursor: usize,
+}
+
+impl InstanceBuffer {
+    fn new(stride: usize) -> Self {
+        Self {
+            buffer: None,
+            stride: stride as u32,
+            capacity: 0,
+            cursor: 0,
+        }
+    }
+
+    fn begin_frame(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn upload<T: Copy>(
+        &mut self,
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        data: &[T],
+    ) -> Result<Option<InstanceSlice>> {
+        if data.is_empty() {
+            return Ok(None);
+        }
+        let required = data.len();
+        if self.buffer.is_none() || required > self.capacity {
+            self.create_buffer(device, required)?;
+        }
+        let stride = self.stride as usize;
+        if self.cursor != 0 && self.cursor + required > self.capacity {
+            self.cursor = 0;
+        }
+        let map_type = if self.cursor == 0 {
+            D3D11_MAP_WRITE_DISCARD
+        } else {
+            D3D11_MAP_WRITE_NO_OVERWRITE
+        };
+        let offset_bytes = (self.cursor * stride) as u32;
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            device_context.Map(
+                self.buffer.as_ref().unwrap(),
+                0,
+                map_type,
+                0,
+                Some(&mut mapped),
+            )?;
+            let dest = (mapped.pData as *mut u8).add(offset_bytes as usize);
+            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, dest, stride * required);
+            device_context.Unmap(self.buffer.as_ref().unwrap(), 0);
+        }
+        self.cursor += required;
+        Ok(Some(InstanceSlice {
+            offset_bytes,
+            count: required as u32,
+        }))
+    }
+
+    fn stride(&self) -> u32 {
+        self.stride
+    }
+
+    fn buffer(&self) -> &ID3D11Buffer {
+        self.buffer
+            .as_ref()
+            .expect("instance buffer is not initialized")
+    }
+
+    fn create_buffer(&mut self, device: &ID3D11Device, min_capacity: usize) -> Result<()> {
+        let capacity = min_capacity.max(MIN_INSTANCE_CAPACITY).next_power_of_two();
+        let desc = D3D11_BUFFER_DESC {
+            ByteWidth: (capacity * self.stride as usize) as u32,
+            Usage: D3D11_USAGE_DYNAMIC,
+            BindFlags: D3D11_BIND_VERTEX_BUFFER.0 as u32,
+            CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+            MiscFlags: 0,
+            StructureByteStride: 0,
+        };
+        let mut buffer = None;
+        unsafe {
+            device.CreateBuffer(&desc, None, Some(&mut buffer))?;
+        }
+        self.buffer = buffer;
+        self.capacity = capacity;
+        self.cursor = 0;
+        Ok(())
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct RectInstanceRaw {
+    origin: [f32; 2],
+    size: [f32; 2],
+    color: [f32; 4],
+    clip: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LineInstanceRaw {
+    p0: [f32; 2],
+    p1: [f32; 2],
+    width_pad: [f32; 2],
+    color: [f32; 4],
+    clip: [f32; 4],
+}
+
+struct InstancedRectPipeline {
+    vertex_shader: ID3D11VertexShader,
+    pixel_shader: ID3D11PixelShader,
+    input_layout: ID3D11InputLayout,
+    blend_state: ID3D11BlendState,
+    geometry: UnitQuadGeometry,
+    instance_buffer: InstanceBuffer,
+    scratch: Vec<RectInstanceRaw>,
+}
+
+impl InstancedRectPipeline {
+    fn new(device: &ID3D11Device, geometry: &UnitQuadGeometry) -> Result<Self> {
+        let vertex_module = RawShaderBytes::new(ShaderModule::InstancedRect, ShaderTarget::Vertex)?;
+        let vertex_shader = create_vertex_shader(device, vertex_module.as_bytes())?;
+        let input_layout = create_instanced_rect_input_layout(device, vertex_module.as_bytes())?;
+        let pixel_module =
+            RawShaderBytes::new(ShaderModule::InstancedRect, ShaderTarget::Fragment)?;
+        let pixel_shader = create_fragment_shader(device, pixel_module.as_bytes())?;
+        Ok(Self {
+            vertex_shader,
+            pixel_shader,
+            input_layout,
+            blend_state: create_blend_state(device)?,
+            geometry: geometry.clone(),
+            instance_buffer: InstanceBuffer::new(std::mem::size_of::<RectInstanceRaw>()),
+            scratch: Vec::new(),
+        })
+    }
+
+    fn begin_frame(&mut self) {
+        self.instance_buffer.begin_frame();
+    }
+
+    fn draw(
+        &mut self,
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        viewport: &[D3D11_VIEWPORT],
+        global_params: &[Option<ID3D11Buffer>],
+        batches: &[InstancedRects],
+    ) -> Result<()> {
+        if batches.is_empty() {
+            return Ok(());
+        }
+        self.bind(device_context, viewport, global_params);
+        for batch in batches {
+            self.draw_batch(device, device_context, batch)?;
+        }
+        self.unbind(device_context);
+        Ok(())
+    }
+
+    fn draw_batch(
+        &mut self,
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        batch: &InstancedRects,
+    ) -> Result<()> {
+        if batch.rects.is_empty() {
+            return Ok(());
+        }
+        let clip = clip_from_content_mask(&batch.content_mask);
+        for chunk in batch.rects.chunks(MAX_INSTANCE_CHUNK) {
+            self.scratch.clear();
+            self.scratch.reserve(chunk.len());
+            for rect in chunk {
+                self.scratch.push(RectInstanceRaw {
+                    origin: [scaled(rect.bounds.origin.x), scaled(rect.bounds.origin.y)],
+                    size: [
+                        scaled(rect.bounds.size.width),
+                        scaled(rect.bounds.size.height),
+                    ],
+                    color: [rect.color.h, rect.color.s, rect.color.l, rect.color.a],
+                    clip,
+                });
+            }
+            if let Some(slice) =
+                self.instance_buffer
+                    .upload(device, device_context, &self.scratch)?
+            {
+                self.bind_instances(device_context, slice.offset_bytes);
+                unsafe {
+                    device_context.DrawIndexedInstanced(
+                        self.geometry.index_count,
+                        slice.count,
+                        0,
+                        0,
+                        0,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn bind(
+        &self,
+        device_context: &ID3D11DeviceContext,
+        viewport: &[D3D11_VIEWPORT],
+        global_params: &[Option<ID3D11Buffer>],
+    ) {
+        unsafe {
+            device_context.IASetInputLayout(Some(&self.input_layout));
+            device_context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            device_context.RSSetViewports(Some(viewport));
+            device_context.VSSetShader(&self.vertex_shader, None);
+            device_context.PSSetShader(&self.pixel_shader, None);
+            device_context.VSSetConstantBuffers(0, Some(global_params));
+            device_context.PSSetConstantBuffers(0, Some(global_params));
+            device_context.OMSetBlendState(&self.blend_state, None, 0xFFFFFFFF);
+            device_context.IASetIndexBuffer(&self.geometry.index_buffer, DXGI_FORMAT_R16_UINT, 0);
+
+            let vertex_buffers = [Some(self.geometry.vertex_buffer.clone())];
+            let strides = [self.geometry.vertex_stride];
+            let offsets = [0u32];
+            device_context.IASetVertexBuffers(
+                0,
+                vertex_buffers.len() as u32,
+                Some(vertex_buffers.as_ptr()),
+                Some(strides.as_ptr()),
+                Some(offsets.as_ptr()),
+            );
+        }
+    }
+
+    fn bind_instances(&self, device_context: &ID3D11DeviceContext, offset_bytes: u32) {
+        unsafe {
+            let instance_buffers = [Some(self.instance_buffer.buffer().clone())];
+            let strides = [self.instance_buffer.stride()];
+            let offsets = [offset_bytes];
+            device_context.IASetVertexBuffers(
+                1,
+                1,
+                Some(instance_buffers.as_ptr()),
+                Some(strides.as_ptr()),
+                Some(offsets.as_ptr()),
+            );
+        }
+    }
+
+    fn unbind(&self, device_context: &ID3D11DeviceContext) {
+        unsafe {
+            device_context.IASetInputLayout(None);
+        }
+    }
+}
+
+struct InstancedLinePipeline {
+    vertex_shader: ID3D11VertexShader,
+    pixel_shader: ID3D11PixelShader,
+    input_layout: ID3D11InputLayout,
+    blend_state: ID3D11BlendState,
+    geometry: UnitQuadGeometry,
+    instance_buffer: InstanceBuffer,
+    scratch: Vec<LineInstanceRaw>,
+}
+
+impl InstancedLinePipeline {
+    fn new(device: &ID3D11Device, geometry: &UnitQuadGeometry) -> Result<Self> {
+        let vertex_module = RawShaderBytes::new(ShaderModule::InstancedLine, ShaderTarget::Vertex)?;
+        let vertex_shader = create_vertex_shader(device, vertex_module.as_bytes())?;
+        let input_layout = create_instanced_line_input_layout(device, vertex_module.as_bytes())?;
+        let pixel_module =
+            RawShaderBytes::new(ShaderModule::InstancedLine, ShaderTarget::Fragment)?;
+        let pixel_shader = create_fragment_shader(device, pixel_module.as_bytes())?;
+        Ok(Self {
+            vertex_shader,
+            pixel_shader,
+            input_layout,
+            blend_state: create_blend_state(device)?,
+            geometry: geometry.clone(),
+            instance_buffer: InstanceBuffer::new(std::mem::size_of::<LineInstanceRaw>()),
+            scratch: Vec::new(),
+        })
+    }
+
+    fn begin_frame(&mut self) {
+        self.instance_buffer.begin_frame();
+    }
+
+    fn draw(
+        &mut self,
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        viewport: &[D3D11_VIEWPORT],
+        global_params: &[Option<ID3D11Buffer>],
+        batches: &[InstancedLines],
+    ) -> Result<()> {
+        if batches.is_empty() {
+            return Ok(());
+        }
+        self.bind(device_context, viewport, global_params);
+        for batch in batches {
+            self.draw_batch(device, device_context, batch)?;
+        }
+        self.unbind(device_context);
+        Ok(())
+    }
+
+    fn draw_batch(
+        &mut self,
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        batch: &InstancedLines,
+    ) -> Result<()> {
+        if batch.segments.is_empty() {
+            return Ok(());
+        }
+        let clip = clip_from_content_mask(&batch.content_mask);
+        for chunk in batch.segments.chunks(MAX_INSTANCE_CHUNK) {
+            self.scratch.clear();
+            self.scratch.reserve(chunk.len());
+            for segment in chunk {
+                self.scratch.push(LineInstanceRaw {
+                    p0: [scaled(segment.p0.x), scaled(segment.p0.y)],
+                    p1: [scaled(segment.p1.x), scaled(segment.p1.y)],
+                    width_pad: [segment.width, 0.0],
+                    color: [
+                        segment.color.h,
+                        segment.color.s,
+                        segment.color.l,
+                        segment.color.a,
+                    ],
+                    clip,
+                });
+            }
+            if let Some(slice) =
+                self.instance_buffer
+                    .upload(device, device_context, &self.scratch)?
+            {
+                self.bind_instances(device_context, slice.offset_bytes);
+                unsafe {
+                    device_context.DrawIndexedInstanced(
+                        self.geometry.index_count,
+                        slice.count,
+                        0,
+                        0,
+                        0,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn bind(
+        &self,
+        device_context: &ID3D11DeviceContext,
+        viewport: &[D3D11_VIEWPORT],
+        global_params: &[Option<ID3D11Buffer>],
+    ) {
+        unsafe {
+            device_context.IASetInputLayout(Some(&self.input_layout));
+            device_context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            device_context.RSSetViewports(Some(viewport));
+            device_context.VSSetShader(&self.vertex_shader, None);
+            device_context.PSSetShader(&self.pixel_shader, None);
+            device_context.VSSetConstantBuffers(0, Some(global_params));
+            device_context.PSSetConstantBuffers(0, Some(global_params));
+            device_context.OMSetBlendState(&self.blend_state, None, 0xFFFFFFFF);
+            device_context.IASetIndexBuffer(&self.geometry.index_buffer, DXGI_FORMAT_R16_UINT, 0);
+
+            let vertex_buffers = [Some(self.geometry.vertex_buffer.clone())];
+            let strides = [self.geometry.vertex_stride];
+            let offsets = [0u32];
+            device_context.IASetVertexBuffers(
+                0,
+                vertex_buffers.len() as u32,
+                Some(vertex_buffers.as_ptr()),
+                Some(strides.as_ptr()),
+                Some(offsets.as_ptr()),
+            );
+        }
+    }
+
+    fn bind_instances(&self, device_context: &ID3D11DeviceContext, offset_bytes: u32) {
+        unsafe {
+            let instance_buffers = [Some(self.instance_buffer.buffer().clone())];
+            let strides = [self.instance_buffer.stride()];
+            let offsets = [offset_bytes];
+            device_context.IASetVertexBuffers(
+                1,
+                1,
+                Some(instance_buffers.as_ptr()),
+                Some(strides.as_ptr()),
+                Some(offsets.as_ptr()),
+            );
+        }
+    }
+
+    fn unbind(&self, device_context: &ID3D11DeviceContext) {
+        unsafe {
+            device_context.IASetInputLayout(None);
+        }
     }
 }
 
@@ -1313,6 +1793,135 @@ fn create_fragment_shader(device: &ID3D11Device, bytes: &[u8]) -> Result<ID3D11P
     }
 }
 
+fn create_instanced_rect_input_layout(
+    device: &ID3D11Device,
+    shader_bytes: &[u8],
+) -> Result<ID3D11InputLayout> {
+    let elements = [
+        D3D11_INPUT_ELEMENT_DESC {
+            SemanticName: s!("POSITION"),
+            SemanticIndex: 0,
+            Format: DXGI_FORMAT_R32G32_FLOAT,
+            InputSlot: 0,
+            AlignedByteOffset: 0,
+            InputSlotClass: D3D11_INPUT_PER_VERTEX_DATA,
+            InstanceDataStepRate: 0,
+        },
+        D3D11_INPUT_ELEMENT_DESC {
+            SemanticName: s!("TEXCOORD"),
+            SemanticIndex: 0,
+            Format: DXGI_FORMAT_R32G32_FLOAT,
+            InputSlot: 1,
+            AlignedByteOffset: 0,
+            InputSlotClass: D3D11_INPUT_PER_INSTANCE_DATA,
+            InstanceDataStepRate: 1,
+        },
+        D3D11_INPUT_ELEMENT_DESC {
+            SemanticName: s!("TEXCOORD"),
+            SemanticIndex: 1,
+            Format: DXGI_FORMAT_R32G32_FLOAT,
+            InputSlot: 1,
+            AlignedByteOffset: D3D11_APPEND_ALIGNED_ELEMENT,
+            InputSlotClass: D3D11_INPUT_PER_INSTANCE_DATA,
+            InstanceDataStepRate: 1,
+        },
+        D3D11_INPUT_ELEMENT_DESC {
+            SemanticName: s!("TEXCOORD"),
+            SemanticIndex: 2,
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            InputSlot: 1,
+            AlignedByteOffset: D3D11_APPEND_ALIGNED_ELEMENT,
+            InputSlotClass: D3D11_INPUT_PER_INSTANCE_DATA,
+            InstanceDataStepRate: 1,
+        },
+        D3D11_INPUT_ELEMENT_DESC {
+            SemanticName: s!("TEXCOORD"),
+            SemanticIndex: 3,
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            InputSlot: 1,
+            AlignedByteOffset: D3D11_APPEND_ALIGNED_ELEMENT,
+            InputSlotClass: D3D11_INPUT_PER_INSTANCE_DATA,
+            InstanceDataStepRate: 1,
+        },
+    ];
+    create_input_layout(device, &elements, shader_bytes)
+}
+
+fn create_instanced_line_input_layout(
+    device: &ID3D11Device,
+    shader_bytes: &[u8],
+) -> Result<ID3D11InputLayout> {
+    let elements = [
+        D3D11_INPUT_ELEMENT_DESC {
+            SemanticName: s!("POSITION"),
+            SemanticIndex: 0,
+            Format: DXGI_FORMAT_R32G32_FLOAT,
+            InputSlot: 0,
+            AlignedByteOffset: 0,
+            InputSlotClass: D3D11_INPUT_PER_VERTEX_DATA,
+            InstanceDataStepRate: 0,
+        },
+        D3D11_INPUT_ELEMENT_DESC {
+            SemanticName: s!("TEXCOORD"),
+            SemanticIndex: 0,
+            Format: DXGI_FORMAT_R32G32_FLOAT,
+            InputSlot: 1,
+            AlignedByteOffset: 0,
+            InputSlotClass: D3D11_INPUT_PER_INSTANCE_DATA,
+            InstanceDataStepRate: 1,
+        },
+        D3D11_INPUT_ELEMENT_DESC {
+            SemanticName: s!("TEXCOORD"),
+            SemanticIndex: 1,
+            Format: DXGI_FORMAT_R32G32_FLOAT,
+            InputSlot: 1,
+            AlignedByteOffset: D3D11_APPEND_ALIGNED_ELEMENT,
+            InputSlotClass: D3D11_INPUT_PER_INSTANCE_DATA,
+            InstanceDataStepRate: 1,
+        },
+        D3D11_INPUT_ELEMENT_DESC {
+            SemanticName: s!("TEXCOORD"),
+            SemanticIndex: 2,
+            Format: DXGI_FORMAT_R32G32_FLOAT,
+            InputSlot: 1,
+            AlignedByteOffset: D3D11_APPEND_ALIGNED_ELEMENT,
+            InputSlotClass: D3D11_INPUT_PER_INSTANCE_DATA,
+            InstanceDataStepRate: 1,
+        },
+        D3D11_INPUT_ELEMENT_DESC {
+            SemanticName: s!("TEXCOORD"),
+            SemanticIndex: 3,
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            InputSlot: 1,
+            AlignedByteOffset: D3D11_APPEND_ALIGNED_ELEMENT,
+            InputSlotClass: D3D11_INPUT_PER_INSTANCE_DATA,
+            InstanceDataStepRate: 1,
+        },
+        D3D11_INPUT_ELEMENT_DESC {
+            SemanticName: s!("TEXCOORD"),
+            SemanticIndex: 4,
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            InputSlot: 1,
+            AlignedByteOffset: D3D11_APPEND_ALIGNED_ELEMENT,
+            InputSlotClass: D3D11_INPUT_PER_INSTANCE_DATA,
+            InstanceDataStepRate: 1,
+        },
+    ];
+    create_input_layout(device, &elements, shader_bytes)
+}
+
+fn create_input_layout(
+    device: &ID3D11Device,
+    elements: &[D3D11_INPUT_ELEMENT_DESC],
+    shader_bytes: &[u8],
+) -> Result<ID3D11InputLayout> {
+    unsafe {
+        let mut layout = None;
+        device.CreateInputLayout(elements, shader_bytes, Some(&mut layout))?;
+        Ok(layout.unwrap())
+    }
+}
+
 #[inline]
 fn create_buffer(
     device: &ID3D11Device,
@@ -1329,6 +1938,31 @@ fn create_buffer(
     };
     let mut buffer = None;
     unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer)) }?;
+    Ok(buffer.unwrap())
+}
+
+fn create_immutable_buffer<T>(
+    device: &ID3D11Device,
+    data: &[T],
+    bind_flags: u32,
+) -> Result<ID3D11Buffer> {
+    let desc = D3D11_BUFFER_DESC {
+        ByteWidth: (std::mem::size_of::<T>() * data.len()) as u32,
+        Usage: D3D11_USAGE_IMMUTABLE,
+        BindFlags: bind_flags,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+        StructureByteStride: 0,
+    };
+    let init_data = D3D11_SUBRESOURCE_DATA {
+        pSysMem: data.as_ptr() as *const _,
+        SysMemPitch: 0,
+        SysMemSlicePitch: 0,
+    };
+    let mut buffer = None;
+    unsafe {
+        device.CreateBuffer(&desc, Some(&init_data), Some(&mut buffer))?;
+    }
     Ok(buffer.unwrap())
 }
 
@@ -1381,6 +2015,20 @@ fn set_pipeline_state(
     }
 }
 
+#[inline]
+fn scaled(value: ScaledPixels) -> f32 {
+    value.0
+}
+
+#[inline]
+fn clip_from_content_mask(mask: &ContentMask<ScaledPixels>) -> [f32; 4] {
+    let left = scaled(mask.bounds.origin.x);
+    let top = scaled(mask.bounds.origin.y);
+    let right = left + scaled(mask.bounds.size.width);
+    let bottom = top + scaled(mask.bounds.size.height);
+    [left, top, right, bottom]
+}
+
 #[cfg(debug_assertions)]
 fn report_live_objects(device: &ID3D11Device) -> Result<()> {
     let debug_device: ID3D11Debug = device.cast()?;
@@ -1414,6 +2062,8 @@ pub(crate) mod shader_resources {
         MonochromeSprite,
         PolychromeSprite,
         EmojiRasterization,
+        InstancedRect,
+        InstancedLine,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1486,6 +2136,14 @@ pub(crate) mod shader_resources {
                 ShaderModule::EmojiRasterization => match target {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
                     ShaderTarget::Fragment => EMOJI_RASTERIZATION_FRAGMENT_BYTES,
+                },
+                ShaderModule::InstancedRect => match target {
+                    ShaderTarget::Vertex => INSTANCED_RECT_VERTEX_BYTES,
+                    ShaderTarget::Fragment => INSTANCED_RECT_FRAGMENT_BYTES,
+                },
+                ShaderModule::InstancedLine => match target {
+                    ShaderTarget::Vertex => INSTANCED_LINE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => INSTANCED_LINE_FRAGMENT_BYTES,
                 },
             };
             Self { inner: bytes }
@@ -1573,6 +2231,8 @@ pub(crate) mod shader_resources {
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
+                ShaderModule::InstancedRect => "instanced_rect",
+                ShaderModule::InstancedLine => "instanced_line",
             }
         }
     }

@@ -1180,3 +1180,105 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     color.a *= sprite.opacity * saturate(0.5 - distance);
     return color;
 }
+
+/*
+**
+**              Instanced rectangles
+**
+*/
+
+struct InstancedRectVertexIn {
+    float2 unit: POSITION;
+};
+
+struct InstancedRectInstance {
+    float2 origin_px: TEXCOORD0;
+    float2 size_px: TEXCOORD1;
+    float4 color_hsla: TEXCOORD2;
+    float4 clip_ltrb: TEXCOORD3;
+};
+
+struct InstancedRectVertexOut {
+    float4 position: SV_Position;
+    float4 color: COLOR0;
+    float4 clip: SV_ClipDistance;
+};
+
+InstancedRectVertexOut instanced_rect_vertex(InstancedRectVertexIn vertex, InstancedRectInstance instance) {
+    float2 px = instance.origin_px + vertex.unit * instance.size_px;
+
+    InstancedRectVertexOut output;
+    output.position = to_device_position_impl(px);
+    Hsla hsla_color;
+    hsla_color.h = instance.color_hsla.x;
+    hsla_color.s = instance.color_hsla.y;
+    hsla_color.l = instance.color_hsla.z;
+    hsla_color.a = instance.color_hsla.w;
+    output.color = hsla_to_rgba(hsla_color);
+    output.clip = float4(
+        px.x - instance.clip_ltrb.x,
+        instance.clip_ltrb.z - px.x,
+        px.y - instance.clip_ltrb.y,
+        instance.clip_ltrb.w - px.y
+    );
+    return output;
+}
+
+float4 instanced_rect_fragment(InstancedRectVertexOut input): SV_Target {
+    return input.color;
+}
+
+/*
+**
+**              Instanced lines
+**
+*/
+
+struct InstancedLineVertexIn {
+    float2 unit: POSITION;
+};
+
+struct InstancedLineInstance {
+    float2 p0_px: TEXCOORD0;
+    float2 p1_px: TEXCOORD1;
+    float2 thickness_pad: TEXCOORD2;
+    float4 color_hsla: TEXCOORD3;
+    float4 clip_ltrb: TEXCOORD4;
+};
+
+struct InstancedLineVertexOut {
+    float4 position: SV_Position;
+    float4 color: COLOR0;
+    float4 clip: SV_ClipDistance;
+};
+
+InstancedLineVertexOut instanced_line_vertex(InstancedLineVertexIn vertex, InstancedLineInstance instance) {
+    float2 dir = instance.p1_px - instance.p0_px;
+    float len = length(dir);
+    float2 tangent = len > 0.0 ? dir / len : float2(1.0, 0.0);
+    float2 normal = float2(-tangent.y, tangent.x);
+
+    float2 along = instance.p0_px + dir * vertex.unit.x;
+    float signed_offset = (vertex.unit.y - 0.5) * instance.thickness_pad.x;
+    float2 px = along + normal * signed_offset;
+
+    InstancedLineVertexOut output;
+    output.position = to_device_position_impl(px);
+    Hsla hsla_color;
+    hsla_color.h = instance.color_hsla.x;
+    hsla_color.s = instance.color_hsla.y;
+    hsla_color.l = instance.color_hsla.z;
+    hsla_color.a = instance.color_hsla.w;
+    output.color = hsla_to_rgba(hsla_color);
+    output.clip = float4(
+        px.x - instance.clip_ltrb.x,
+        instance.clip_ltrb.z - px.x,
+        px.y - instance.clip_ltrb.y,
+        instance.clip_ltrb.w - px.y
+    );
+    return output;
+}
+
+float4 instanced_line_fragment(InstancedLineVertexOut input): SV_Target {
+    return input.color;
+}

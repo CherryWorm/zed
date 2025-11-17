@@ -1,9 +1,11 @@
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn main() {
-    eprintln!("batched_primitives: this example currently renders on macOS/Metal only.");
+    eprintln!(
+        "batched_primitives: this example currently renders on macOS/Metal or Windows/Direct3D only."
+    );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod demo {
     use gpui::{
         App, Application, Bounds, Context, Hsla, Pixels, Point, RectInstance, Window, WindowBounds,
@@ -159,7 +161,7 @@ mod demo {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn main() {
     demo::main();
 }
