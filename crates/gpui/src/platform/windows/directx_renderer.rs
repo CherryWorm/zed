@@ -634,21 +634,25 @@ impl DirectXRenderer {
     }
 
     fn draw_instanced_rects(&mut self, batches: &[InstancedRects]) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
         self.pipelines.instanced_rect_pipeline.draw(
-            &self.devices.device,
-            &self.devices.device_context,
-            &self.resources.viewport,
-            &self.globals.global_params_buffer,
+            &devices.device,
+            &devices.device_context,
+            slice::from_ref(&resources.viewport),
+            slice::from_ref(&self.globals.global_params_buffer),
             batches,
         )
     }
 
     fn draw_instanced_lines(&mut self, batches: &[InstancedLines]) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
         self.pipelines.instanced_line_pipeline.draw(
-            &self.devices.device,
-            &self.devices.device_context,
-            &self.resources.viewport,
-            &self.globals.global_params_buffer,
+            &devices.device,
+            &devices.device_context,
+            slice::from_ref(&resources.viewport),
+            slice::from_ref(&self.globals.global_params_buffer),
             batches,
         )
     }
