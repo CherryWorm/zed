@@ -910,12 +910,18 @@ impl MetalRenderer {
         align_offset(instance_offset);
         let mut vertices = Vec::new();
         for arc_path in paths {
-            vertices.extend(arc_path.path.vertices.iter().map(|v| PathRasterizationVertex {
-                xy_position: v.xy_position,
-                st_position: v.st_position,
-                color: arc_path.color,
-                bounds: arc_path.clipped_bounds(),
-            }));
+            vertices.extend(
+                arc_path
+                    .path
+                    .vertices
+                    .iter()
+                    .map(|v| PathRasterizationVertex {
+                        xy_position: v.xy_position,
+                        st_position: v.st_position,
+                        color: arc_path.color,
+                        bounds: arc_path.clipped_bounds(),
+                    }),
+            );
         }
         let vertices_bytes_len = mem::size_of_val(vertices.as_slice());
         let next_offset = *instance_offset + vertices_bytes_len;

@@ -743,7 +743,11 @@ pub(crate) struct ArcPath {
 }
 
 impl ArcPath {
-    pub fn new(path: Arc<Path<ScaledPixels>>, content_mask: ContentMask<ScaledPixels>, color: Background) -> Self {
+    pub fn new(
+        path: Arc<Path<ScaledPixels>>,
+        content_mask: ContentMask<ScaledPixels>,
+        color: Background,
+    ) -> Self {
         Self {
             path,
             order: DrawOrder::default(),
