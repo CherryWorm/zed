@@ -6,10 +6,11 @@ use std::f32::consts::{PI, TAU};
 use std::sync::Arc;
 use std::time::Instant;
 
+use gpui_platform::application;
 use gpui::{
-    Application, Background, Bounds, Context, Path, PathBuilder, Pixels, Point, Render,
-    ScaledPixels, TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, hsla,
-    linear_color_stop, linear_gradient, point, prelude::*, px, size,
+    Background, Bounds, Context, Path, PathBuilder, Pixels, Point, Render, ScaledPixels,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, hsla, linear_color_stop,
+    linear_gradient, point, prelude::*, px, size,
 };
 
 const DEFAULT_WINDOW_WIDTH: Pixels = px(1200.0);
@@ -194,7 +195,7 @@ impl Render for MandalaViewer {
 }
 
 fn main() {
-    Application::new().run(|cx| {
+    application().run(|cx| {
         cx.open_window(
             WindowOptions {
                 titlebar: Some(TitlebarOptions {

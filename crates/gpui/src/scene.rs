@@ -733,8 +733,9 @@ pub struct PathId(pub usize);
 
 /// A wrapper around an Arc<Path> that stores the path geometry separately from
 /// the mutable metadata (order, id, content_mask, color) that is set during scene insertion.
+#[expect(missing_docs)]
 #[derive(Clone, Debug)]
-pub(crate) struct ArcPath {
+pub struct ArcPath {
     pub path: Arc<Path<ScaledPixels>>,
     pub order: DrawOrder,
     pub id: PathId,
@@ -744,6 +745,7 @@ pub(crate) struct ArcPath {
     pub color: Background,
 }
 
+#[expect(missing_docs)]
 impl ArcPath {
     pub fn new(
         path: Arc<Path<ScaledPixels>>,
